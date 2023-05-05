@@ -144,7 +144,7 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}) {
 			SELECT 
 				dda.id,
 				dda.received_time as created_at,
-				convert_from(created_id, 'utf8') as created_id,
+				created_id,
 				device_id,
 				object_id,
 				mes_id,
@@ -164,6 +164,7 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}) {
 			fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 		}
 
+		var countRow int
 		for rows.Next() {
 			// err = rows.Scan
 			err = rows.Scan(&rowVal)
@@ -172,33 +173,111 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}) {
 			}
 
 			msgChan <- rowVal
+			countRow++
 		}
 		offset = int(rowVal["id"].(float64))
+		log.Println("Records read: ", countRow)
 		time.Sleep(1 * time.Millisecond)
 	}
 	close(msgChan)
 }
 
-func (pg *Postgres) writer(msgChan chan map[string]interface{}) {
+func serializeRow(row map[string]interface{}) []interface{} {
+	var res []interface{}
+	columns := []string{
+		"id",
+		"created_at",
+		"created_id",
+		"device_id",
+		"object_id",
+		"mes_id",
+		"mes_time",
+		"mes_code",
+		"mes_status",
+		"mes_data",
+		"event_value",
+		"event_data",
+	}
+	for _, value := range columns {
+		if value == "created_at" || value == "mes_time" {
+			timeVal, err := time.Parse("2006-01-02T15:04:05", row[value].(string))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed time.Parse: %v\n", err)
+			}
+			res = append(res, timeVal)
+			continue
+		}
+		res = append(res, row[value])
+	}
+	return res
+}
+
+func checkPartition(partitions []string, section string) bool {
+	for _, n := range partitions {
+		if section == n {
+			return true
+		}
+	}
+	return false
+}
+
+func (pg *Postgres) createSection(id int, section string) {
+	query := fmt.Sprintf("CREATE TABLE %s PARTITION OF device.messages FOR VALUES IN (%d)", section, id)
+	_, err := pg.Conn.Exec(context.Background(), query)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Query CREATE PARTITION failed: %v\n", err)
+	}
+	log.Println("Create section :", section)
+}
+
+func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []string) {
+	var (
+		rows   [][]interface{}
+		serRow []interface{}
+		count  int
+	)
+
+	// Получение сообщений из канала
 	for msg := range msgChan {
-		_, err := pg.Conn.Exec(context.Background(),
-			`INSERT INTO device.messages (
-				offset_msg,
-				created_at,
-				created_id,
-				device_id,
-				object_id,
-				mes_id,
-				mes_time,
-				mes_code,
-				mes_status,
-				mes_data,
-				event_value,
-				event_data
+
+		// Заполенение чанка
+		if count < pg.chunk {
+			id := int(msg["id"].(float64))
+			section := fmt.Sprintf("message_%d", id)
+
+			if !checkPartition(partition, section) {
+				pg.createSection(id, section)
+				partition = append(partition, section)
+			}
+
+			serRow = serializeRow(msg)
+			rows = append(rows, serRow)
+			count++
+		} else {
+			// Вставка в таблицу
+			a := pg.getOffset()
+			log.Println(a)
+			log.Println(len(rows[0]))
+			copyCount, err := pg.Conn.CopyFrom(
+				context.Background(),
+				pgx.Identifier{"device", "messages"},
+				[]string{"offset_msg",
+					"created_at",
+					"created_id",
+					"device_id",
+					"object_id",
+					"mes_id",
+					"mes_time",
+					"mes_code", "mes_status", "mes_data", "event_value", "event_data"},
+				pgx.CopyFromRows(rows),
 			)
-			VALUES $1;`, msg)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "QueryRow failed: %v\n", err)
+
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed CopyFrom: %v\n", err)
+			}
+			log.Println("Вставлено :", copyCount)
+			count = 0
+			rows = nil
 		}
 	}
 }
@@ -211,11 +290,11 @@ func main() {
 		partition    []string
 	)
 
-	msgChan := make(chan map[string]interface{}, 1000)
+	msgChan := make(chan map[string]interface{}, 10000)
 	checkChan := make(chan bool)
 
 	configPG1 := Postgres{}
-	configPG1.chunk = 5
+	configPG1.chunk = 10000
 	configPG1.pgEnv("HOST_DB_1", "PORT_DB_1", "USERNAME_DB_1", "PASSWORD_DB_1", "DBNAME_DB_1")
 	configPG1.connPgloop()
 
@@ -223,7 +302,7 @@ func main() {
 	log.Println(countRowsDB1)
 
 	configPG2 := Postgres{}
-	configPG2.chunk = 100
+	configPG2.chunk = 2000
 	configPG2.pgEnv("HOST_DB_2", "PORT_DB_2", "USERNAME_DB_2", "PASSWORD_DB_2", "DBNAME_DB_2")
 	configPG2.connPgloop()
 
@@ -240,7 +319,7 @@ func main() {
 
 	go configPG1.reader(offset_msg, msgChan)
 
-	go configPG2.writer(msgChan)
+	go configPG2.writer(msgChan, partition)
 
 	<-checkChan
 }
