@@ -168,7 +168,6 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}, time
 
 		var countRow int
 		for rows.Next() {
-			// err = rows.Scan
 			err = rows.Scan(&rowVal)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed scan: %v\n", err)
@@ -189,7 +188,6 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}, time
 		start = time.Now()
 
 		log.Println("Records read: ", countRow)
-		time.Sleep(1 * time.Millisecond)
 	}
 	close(msgChan)
 }
@@ -251,7 +249,6 @@ func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []stri
 	start := time.Now()
 	// Получение сообщений из канала
 	for msg := range msgChan {
-
 		// Заполенение чанка
 		if count < pg.chunk {
 			id := int(msg["object_id"].(float64))
@@ -310,7 +307,7 @@ func timeMeter(countR1 int, countR2 int, timeChan chan map[string]int) {
 		ok_1        bool
 		ok_2        bool
 		time_reader int
-		percent     int
+		percent     float32
 		mR          int
 		mTimeAll    int
 	)
@@ -318,13 +315,14 @@ func timeMeter(countR1 int, countR2 int, timeChan chan map[string]int) {
 	wrRows := countR2
 
 	for msg := range timeChan {
+
 		time_writer, ok_1 = msg["writeTime"]
 		if ok_1 {
 			rows_writer := msg["writerRows"]
 			timeW = append(timeW, time_writer)
 			wrRows += rows_writer
 			mW = midlTime(timeW)
-			percent = wrRows / countR1 * 100
+			percent = float32(wrRows) / float32(countR1) * 100
 		}
 
 		time_reader, ok_2 = msg["readTime"]
@@ -394,7 +392,7 @@ func main() {
 
 	go configPG2.writer(msgChan, partition, makeTimeChan)
 
-	// go timeMeter(countRowsDB1, countRowsDB2, makeTimeChan)
+	go timeMeter(countRowsDB1, countRowsDB2, makeTimeChan)
 
 	<-checkChan
 }
