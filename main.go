@@ -132,10 +132,12 @@ func (pg *Postgres) connPgloop() {
 
 }
 
-func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}) {
+func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}, timeChan chan map[string]int) {
 	var (
 		rowVal map[string]interface{}
 	)
+
+	start := time.Now()
 
 	for {
 		rows, err := pg.Conn.Query(context.Background(),
@@ -176,6 +178,16 @@ func (pg *Postgres) reader(offset int, msgChan chan map[string]interface{}) {
 			countRow++
 		}
 		offset = int(rowVal["id"].(float64))
+
+		mTime := make(map[string]int, 2)
+
+		mTime["readTime"] = int(time.Since(start).Seconds())
+		mTime["readerRows"] = int(countRow)
+
+		timeChan <- mTime
+
+		start = time.Now()
+
 		log.Println("Records read: ", countRow)
 		time.Sleep(1 * time.Millisecond)
 	}
@@ -230,13 +242,13 @@ func (pg *Postgres) createSection(id int, section string) {
 	log.Println("Create section :", section)
 }
 
-func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []string) {
+func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []string, timeChan chan map[string]int) {
 	var (
 		rows   [][]interface{}
 		serRow []interface{}
 		count  int
 	)
-
+	start := time.Now()
 	// Получение сообщений из канала
 	for msg := range msgChan {
 
@@ -253,33 +265,96 @@ func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []stri
 			serRow = serializeRow(msg)
 			rows = append(rows, serRow)
 			count++
-		} else {
-			// Вставка в таблицу
-			a := pg.getOffset()
-			log.Println(a)
-			log.Println(len(rows[0]))
-			copyCount, err := pg.Conn.CopyFrom(
-				context.Background(),
-				pgx.Identifier{"device", "messages"},
-				[]string{"offset_msg",
-					"created_at",
-					"created_id",
-					"device_id",
-					"object_id",
-					"mes_id",
-					"mes_time",
-					"mes_code", "mes_status", "mes_data", "event_value", "event_data"},
-				pgx.CopyFromRows(rows),
-			)
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed CopyFrom: %v\n", err)
-			}
-			log.Println("Вставлено :", copyCount)
-			count = 0
-			rows = nil
+			continue
 		}
+
+		// Вставка в таблицу
+		a := pg.getOffset()
+		log.Println(a)
+		log.Println(len(rows[0]))
+		copyCount, err := pg.Conn.CopyFrom(
+			context.Background(),
+			pgx.Identifier{"device", "messages"},
+			[]string{"offset_msg",
+				"created_at",
+				"created_id",
+				"device_id",
+				"object_id",
+				"mes_id",
+				"mes_time",
+				"mes_code", "mes_status", "mes_data", "event_value", "event_data"},
+			pgx.CopyFromRows(rows),
+		)
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed CopyFrom: %v\n", err)
+		}
+
+		mTime := make(map[string]int, 2)
+
+		mTime["writeTime"] = int(time.Since(start).Seconds())
+		mTime["writerRows"] = int(copyCount)
+
+		timeChan <- mTime
+
+		log.Println("Вставлено :", copyCount)
+		count = 0
+		rows = nil
+		start = time.Now()
 	}
+}
+
+func timeMeter(countR1 int, countR2 int, timeChan chan map[string]int) {
+	var (
+		timeR       []int
+		timeW       []int
+		mW          int
+		time_writer int
+		ok_1        bool
+		ok_2        bool
+		time_reader int
+		percent     int
+		mR          int
+		mTimeAll    int
+	)
+	remRows := countR1 - countR2
+	wrRows := countR2
+
+	for msg := range timeChan {
+		time_writer, ok_1 = msg["writeTime"]
+		if ok_1 {
+			rows_writer := msg["writerRows"]
+			timeW = append(timeW, time_writer)
+			wrRows += rows_writer
+			mW = midlTime(timeW)
+			percent = wrRows / countR1 * 100
+		}
+
+		time_reader, ok_2 = msg["readTime"]
+		if ok_2 {
+			rows_reader := msg["readerRows"]
+			timeR = append(timeR, time_reader)
+			mR = midlTime(timeR)
+			remRows -= rows_reader
+			mTimeAll = remRows / rows_reader * mR / 60
+		}
+
+		log.Println("\nСреднее время записи: ", mW, "\n",
+			"Среднее время чтения: ", mR, "\n",
+			"Осталось прочитать: ", remRows, "\n",
+			"Прочитано: ", wrRows, "\n",
+			"Процент выполнения: ", percent, "\n",
+			"Осталось времени: ", mTimeAll)
+	}
+}
+
+func midlTime(arr []int) int {
+	var sum int
+	for _, item := range arr {
+		sum += item
+	}
+	midl := sum / len(arr)
+	return midl
 }
 
 func main() {
@@ -291,10 +366,11 @@ func main() {
 	)
 
 	msgChan := make(chan map[string]interface{}, 10000)
+	makeTimeChan := make(chan map[string]int, 1000)
 	checkChan := make(chan bool)
 
 	configPG1 := Postgres{}
-	configPG1.chunk = 10000
+	configPG1.chunk = 20000
 	configPG1.pgEnv("HOST_DB_1", "PORT_DB_1", "USERNAME_DB_1", "PASSWORD_DB_1", "DBNAME_DB_1")
 	configPG1.connPgloop()
 
@@ -302,7 +378,7 @@ func main() {
 	log.Println(countRowsDB1)
 
 	configPG2 := Postgres{}
-	configPG2.chunk = 2000
+	configPG2.chunk = 4000
 	configPG2.pgEnv("HOST_DB_2", "PORT_DB_2", "USERNAME_DB_2", "PASSWORD_DB_2", "DBNAME_DB_2")
 	configPG2.connPgloop()
 
@@ -317,9 +393,11 @@ func main() {
 		log.Println(partition)
 	}
 
-	go configPG1.reader(offset_msg, msgChan)
+	go configPG1.reader(offset_msg, msgChan, makeTimeChan)
 
-	go configPG2.writer(msgChan, partition)
+	go configPG2.writer(msgChan, partition, makeTimeChan)
+
+	go timeMeter(countRowsDB1, countRowsDB2, makeTimeChan)
 
 	<-checkChan
 }
