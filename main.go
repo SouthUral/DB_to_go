@@ -242,7 +242,7 @@ func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []stri
 
 		// Заполенение чанка
 		if count < pg.chunk {
-			id := int(msg["id"].(float64))
+			id := int(msg["object_id"].(float64))
 			section := fmt.Sprintf("message_%d", id)
 
 			if !checkPartition(partition, section) {
