@@ -269,9 +269,6 @@ func (pg *Postgres) writer(msgChan chan map[string]interface{}, partition []stri
 		}
 
 		// Вставка в таблицу
-		a := pg.getOffset()
-		log.Println(a)
-		log.Println(len(rows[0]))
 		copyCount, err := pg.Conn.CopyFrom(
 			context.Background(),
 			pgx.Identifier{"device", "messages"},
@@ -397,7 +394,7 @@ func main() {
 
 	go configPG2.writer(msgChan, partition, makeTimeChan)
 
-	go timeMeter(countRowsDB1, countRowsDB2, makeTimeChan)
+	// go timeMeter(countRowsDB1, countRowsDB2, makeTimeChan)
 
 	<-checkChan
 }
